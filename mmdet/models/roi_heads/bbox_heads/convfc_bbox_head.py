@@ -1,13 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional, Tuple, Union
-
+from typing import Optional, Tuple, Union, List
+import cv2
+import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule
 from mmengine.config import ConfigDict
 from torch import Tensor
 
 from mmdet.registry import MODELS
+from mmdet.models.utils.misc import multi_apply
 from .bbox_head import BBoxHead
+from mmdet.models.task_modules.samplers import SamplingResult
+from mmdet.structures.bbox import get_box_tensor, scale_boxes
 
 
 @MODELS.register_module()
@@ -22,23 +26,32 @@ class ConvFCBBoxHead(BBoxHead):
                                     \-> reg convs -> reg fcs -> reg
     """  # noqa: W605
 
-    def __init__(self,
-                 num_shared_convs: int = 0,
-                 num_shared_fcs: int = 0,
-                 num_cls_convs: int = 0,
-                 num_cls_fcs: int = 0,
-                 num_reg_convs: int = 0,
-                 num_reg_fcs: int = 0,
-                 conv_out_channels: int = 256,
-                 fc_out_channels: int = 1024,
-                 conv_cfg: Optional[Union[dict, ConfigDict]] = None,
-                 norm_cfg: Optional[Union[dict, ConfigDict]] = None,
-                 init_cfg: Optional[Union[dict, ConfigDict]] = None,
-                 *args,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        num_shared_convs: int = 0,
+        num_shared_fcs: int = 0,
+        num_cls_convs: int = 0,
+        num_cls_fcs: int = 0,
+        num_reg_convs: int = 0,
+        num_reg_fcs: int = 0,
+        conv_out_channels: int = 256,
+        fc_out_channels: int = 1024,
+        conv_cfg: Optional[Union[dict, ConfigDict]] = None,
+        norm_cfg: Optional[Union[dict, ConfigDict]] = None,
+        init_cfg: Optional[Union[dict, ConfigDict]] = None,
+        *args,
+        **kwargs
+    ) -> None:
         super().__init__(*args, init_cfg=init_cfg, **kwargs)
-        assert (num_shared_convs + num_shared_fcs + num_cls_convs +
-                num_cls_fcs + num_reg_convs + num_reg_fcs > 0)
+        assert (
+            num_shared_convs
+            + num_shared_fcs
+            + num_cls_convs
+            + num_cls_fcs
+            + num_reg_convs
+            + num_reg_fcs
+            > 0
+        )
         if num_cls_convs > 0 or num_reg_convs > 0:
             assert num_shared_fcs == 0
         if not self.with_cls:
@@ -57,21 +70,20 @@ class ConvFCBBoxHead(BBoxHead):
         self.norm_cfg = norm_cfg
 
         # add shared convs and fcs
-        self.shared_convs, self.shared_fcs, last_layer_dim = \
-            self._add_conv_fc_branch(
-                self.num_shared_convs, self.num_shared_fcs, self.in_channels,
-                True)
+        self.shared_convs, self.shared_fcs, last_layer_dim = self._add_conv_fc_branch(
+            self.num_shared_convs, self.num_shared_fcs, self.in_channels, True
+        )
         self.shared_out_channels = last_layer_dim
 
         # add cls specific branch
-        self.cls_convs, self.cls_fcs, self.cls_last_dim = \
-            self._add_conv_fc_branch(
-                self.num_cls_convs, self.num_cls_fcs, self.shared_out_channels)
+        self.cls_convs, self.cls_fcs, self.cls_last_dim = self._add_conv_fc_branch(
+            self.num_cls_convs, self.num_cls_fcs, self.shared_out_channels
+        )
 
         # add reg specific branch
-        self.reg_convs, self.reg_fcs, self.reg_last_dim = \
-            self._add_conv_fc_branch(
-                self.num_reg_convs, self.num_reg_fcs, self.shared_out_channels)
+        self.reg_convs, self.reg_fcs, self.reg_last_dim = self._add_conv_fc_branch(
+            self.num_reg_convs, self.num_reg_fcs, self.shared_out_channels
+        )
 
         if self.num_shared_fcs == 0 and not self.with_avg_pool:
             if self.num_cls_fcs == 0:
@@ -88,16 +100,19 @@ class ConvFCBBoxHead(BBoxHead):
                 cls_channels = self.num_classes + 1
             cls_predictor_cfg_ = self.cls_predictor_cfg.copy()
             cls_predictor_cfg_.update(
-                in_features=self.cls_last_dim, out_features=cls_channels)
+                in_features=self.cls_last_dim, out_features=cls_channels
+            )
             self.fc_cls = MODELS.build(cls_predictor_cfg_)
         if self.with_reg:
             box_dim = self.bbox_coder.encode_size
-            out_dim_reg = box_dim if self.reg_class_agnostic else \
-                box_dim * self.num_classes
+            out_dim_reg = (
+                box_dim if self.reg_class_agnostic else box_dim * self.num_classes
+            )
             reg_predictor_cfg_ = self.reg_predictor_cfg.copy()
             if isinstance(reg_predictor_cfg_, (dict, ConfigDict)):
                 reg_predictor_cfg_.update(
-                    in_features=self.reg_last_dim, out_features=out_dim_reg)
+                    in_features=self.reg_last_dim, out_features=out_dim_reg
+                )
             self.fc_reg = MODELS.build(reg_predictor_cfg_)
 
         if init_cfg is None:
@@ -110,20 +125,23 @@ class ConvFCBBoxHead(BBoxHead):
             # for `shared_fcs`, `cls_fcs` and `reg_fcs`
             self.init_cfg += [
                 dict(
-                    type='Xavier',
-                    distribution='uniform',
+                    type="Xavier",
+                    distribution="uniform",
                     override=[
-                        dict(name='shared_fcs'),
-                        dict(name='cls_fcs'),
-                        dict(name='reg_fcs')
-                    ])
+                        dict(name="shared_fcs"),
+                        dict(name="cls_fcs"),
+                        dict(name="reg_fcs"),
+                    ],
+                )
             ]
 
-    def _add_conv_fc_branch(self,
-                            num_branch_convs: int,
-                            num_branch_fcs: int,
-                            in_channels: int,
-                            is_shared: bool = False) -> tuple:
+    def _add_conv_fc_branch(
+        self,
+        num_branch_convs: int,
+        num_branch_fcs: int,
+        in_channels: int,
+        is_shared: bool = False,
+    ) -> tuple:
         """Add shared or separable branch.
 
         convs -> avg pool (optional) -> fcs
@@ -133,8 +151,7 @@ class ConvFCBBoxHead(BBoxHead):
         branch_convs = nn.ModuleList()
         if num_branch_convs > 0:
             for i in range(num_branch_convs):
-                conv_in_channels = (
-                    last_layer_dim if i == 0 else self.conv_out_channels)
+                conv_in_channels = last_layer_dim if i == 0 else self.conv_out_channels
                 branch_convs.append(
                     ConvModule(
                         conv_in_channels,
@@ -142,21 +159,20 @@ class ConvFCBBoxHead(BBoxHead):
                         3,
                         padding=1,
                         conv_cfg=self.conv_cfg,
-                        norm_cfg=self.norm_cfg))
+                        norm_cfg=self.norm_cfg,
+                    )
+                )
             last_layer_dim = self.conv_out_channels
         # add branch specific fc layers
         branch_fcs = nn.ModuleList()
         if num_branch_fcs > 0:
             # for shared branch, only consider self.with_avg_pool
             # for separated branches, also consider self.num_shared_fcs
-            if (is_shared
-                    or self.num_shared_fcs == 0) and not self.with_avg_pool:
+            if (is_shared or self.num_shared_fcs == 0) and not self.with_avg_pool:
                 last_layer_dim *= self.roi_feat_area
             for i in range(num_branch_fcs):
-                fc_in_channels = (
-                    last_layer_dim if i == 0 else self.fc_out_channels)
-                branch_fcs.append(
-                    nn.Linear(fc_in_channels, self.fc_out_channels))
+                fc_in_channels = last_layer_dim if i == 0 else self.fc_out_channels
+                branch_fcs.append(nn.Linear(fc_in_channels, self.fc_out_channels))
             last_layer_dim = self.fc_out_channels
         return branch_convs, branch_fcs, last_layer_dim
 
@@ -219,7 +235,6 @@ class ConvFCBBoxHead(BBoxHead):
 
 @MODELS.register_module()
 class Shared2FCBBoxHead(ConvFCBBoxHead):
-
     def __init__(self, fc_out_channels: int = 1024, *args, **kwargs) -> None:
         super().__init__(
             num_shared_convs=0,
@@ -230,12 +245,12 @@ class Shared2FCBBoxHead(ConvFCBBoxHead):
             num_reg_fcs=0,
             fc_out_channels=fc_out_channels,
             *args,
-            **kwargs)
+            **kwargs
+        )
 
 
 @MODELS.register_module()
 class Shared4Conv1FCBBoxHead(ConvFCBBoxHead):
-
     def __init__(self, fc_out_channels: int = 1024, *args, **kwargs) -> None:
         super().__init__(
             num_shared_convs=4,
@@ -246,4 +261,219 @@ class Shared4Conv1FCBBoxHead(ConvFCBBoxHead):
             num_reg_fcs=0,
             fc_out_channels=fc_out_channels,
             *args,
-            **kwargs)
+            **kwargs
+        )
+
+
+@MODELS.register_module()
+class ColorFCBBoxHead(Shared2FCBBoxHead):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.fc_cor = nn.Linear(self.cls_last_dim, 1)
+
+    def loss_and_target(
+        self,
+        cls_score: Tensor,
+        bbox_pred: Tensor,
+        rois: Tensor,
+        sampling_results: List[SamplingResult],
+        rcnn_train_cfg: ConfigDict,
+        concat: bool = True,
+        reduction_override: Optional[str] = None,
+    ) -> dict:
+        cls_reg_targets = self.get_targets(
+            sampling_results, rcnn_train_cfg, concat=concat
+        )
+        losses = self.loss(
+            cls_score,
+            bbox_pred,
+            rois,
+            *cls_reg_targets,
+            reduction_override=reduction_override
+        )
+
+        # cls_reg_targets is only for cascade rcnn
+        return dict(loss_bbox=losses, bbox_targets=cls_reg_targets)
+
+    def forward(self, x: Tuple[Tensor]) -> tuple:
+        # shared part
+        if self.num_shared_convs > 0:
+            for conv in self.shared_convs:
+                x = conv(x)
+
+        if self.num_shared_fcs > 0:
+            if self.with_avg_pool:
+                x = self.avg_pool(x)
+
+            x = x.flatten(1)
+
+            for fc in self.shared_fcs:
+                x = self.relu(fc(x))
+        # separate branches
+        x_cls = x
+        x_reg = x
+        x_cor = x
+
+        for conv in self.cls_convs:
+            x_cls = conv(x_cls)
+        if x_cls.dim() > 2:
+            if self.with_avg_pool:
+                x_cls = self.avg_pool(x_cls)
+            x_cls = x_cls.flatten(1)
+        for fc in self.cls_fcs:
+            x_cls = self.relu(fc(x_cls))
+
+        for conv in self.reg_convs:
+            x_reg = conv(x_reg)
+        if x_reg.dim() > 2:
+            if self.with_avg_pool:
+                x_reg = self.avg_pool(x_reg)
+            x_reg = x_reg.flatten(1)
+        for fc in self.reg_fcs:
+            x_reg = self.relu(fc(x_reg))
+
+        cls_score = self.fc_cls(x_cls) if self.with_cls else None
+        bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
+        cor_pred = self.fc_cor(x_cor)
+        return cls_score, bbox_pred, cor_pred
+
+    def get_targets(
+        self,
+        sampling_results: List[SamplingResult],
+        rcnn_train_cfg: ConfigDict,
+        concat: bool = True,
+        batch_inputs=None,
+    ) -> tuple:
+        pos_priors_list = [res.pos_priors for res in sampling_results]
+        neg_priors_list = [res.neg_priors for res in sampling_results]
+        pos_gt_bboxes_list = [res.pos_gt_bboxes for res in sampling_results]
+        pos_gt_labels_list = [res.pos_gt_labels for res in sampling_results]
+        labels, label_weights, bbox_targets, bbox_weights, color_targets = multi_apply(
+            self._get_targets_single,
+            batch_inputs,
+            pos_priors_list,
+            neg_priors_list,
+            pos_gt_bboxes_list,
+            pos_gt_labels_list,
+            cfg=rcnn_train_cfg,
+        )
+
+        if concat:
+            labels = torch.cat(labels, 0)
+            label_weights = torch.cat(label_weights, 0)
+            bbox_targets = torch.cat(bbox_targets, 0)
+            bbox_weights = torch.cat(bbox_weights, 0)
+            color_targets = torch.cat(color_targets, 0)
+        return labels, label_weights, bbox_targets, bbox_weights, color_targets
+
+    def loss_and_target(
+        self,
+        cls_score: Tensor,
+        bbox_pred: Tensor,
+        color_pred,
+        rois: Tensor,
+        sampling_results: List[SamplingResult],
+        rcnn_train_cfg: ConfigDict,
+        concat: bool = True,
+        reduction_override: Optional[str] = None,
+        batch_inputs=None,
+    ) -> dict:
+        cls_reg_targets = self.get_targets(
+            sampling_results, rcnn_train_cfg, concat=concat, batch_inputs=batch_inputs
+        )
+        losses = self.loss(
+            cls_score,
+            bbox_pred,
+            rois,
+            *cls_reg_targets,
+            color_pred,
+            reduction_override=reduction_override
+        )
+
+        # cls_reg_targets is only for cascade rcnn
+        return dict(loss_bbox=losses, bbox_targets=cls_reg_targets)
+
+    def _get_targets_single(
+        self,
+        img,
+        pos_priors: Tensor,
+        neg_priors: Tensor,
+        pos_gt_bboxes: Tensor,
+        pos_gt_labels: Tensor,
+        cfg: ConfigDict,
+    ) -> tuple:
+        num_pos = pos_priors.size(0)
+        num_neg = neg_priors.size(0)
+        num_samples = num_pos + num_neg  # 共采样512张
+
+        # original implementation uses new_zeros since BG are set to be 0
+        # now use empty & fill because BG cat_id = num_classes,
+        # FG cat_id = [0, num_classes-1]
+        labels = pos_priors.new_full((num_samples,), self.num_classes, dtype=torch.long)
+        reg_dim = (
+            pos_gt_bboxes.size(-1)
+            if self.reg_decoded_bbox
+            else self.bbox_coder.encode_size
+        )
+        label_weights = pos_priors.new_zeros(num_samples)
+        bbox_targets = pos_priors.new_zeros(num_samples, reg_dim)
+        color_targets = pos_priors.new_zeros(num_samples, 1)  # 颜色标签
+        bbox_weights = pos_priors.new_zeros(num_samples, reg_dim)
+        if num_pos > 0:
+            labels[:num_pos] = pos_gt_labels
+            pos_weight = 1.0 if cfg.pos_weight <= 0 else cfg.pos_weight
+            label_weights[:num_pos] = pos_weight
+            if not self.reg_decoded_bbox:
+                pos_bbox_targets = self.bbox_coder.encode(pos_priors, pos_gt_bboxes)
+            else:
+                # When the regression loss (e.g. `IouLoss`, `GIouLoss`)
+                # is applied directly on the decoded bounding boxes, both
+                # the predicted boxes and regression targets should be with
+                # absolute coordinate format.
+                pos_bbox_targets = get_box_tensor(pos_gt_bboxes)
+            bbox_targets[:num_pos, :] = pos_bbox_targets
+            color_targets[:num_pos] = self.color_sim(
+                pos_priors, pos_gt_bboxes, img
+            )  # 颜色相似度la'b
+            # color_targets[:num_pos] =
+            bbox_weights[:num_pos, :] = 1
+        if num_neg > 0:
+            label_weights[-num_neg:] = 1.0
+
+        return labels, label_weights, bbox_targets, bbox_weights, color_targets
+
+    def color_sim(self, bboxes1, bboxes2, img):
+        """计算颜色相似度"""
+        # bboxes1 = bboxes1.unsqueeze(0)
+        # bboxes2 = bboxes2.unsqueeze(0)
+        # img = de_norm(img)  # 反归一化
+        img = img.cpu().clone().detach()
+        img = (
+            img.mul_(255)
+            .add_(0.5)
+            .clamp_(0, 255)
+            .permute(1, 2, 0)
+            .type(torch.uint8)
+            .numpy()
+        )
+        cv2.imwrite("/home/img/a.png", img)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h, s, v = img[:, :, 0], img[:, :, 0], img[:, :, 0]
+        img = h
+        sim = []
+        for (x_min1, y_min1, x_max1, y_max1), (x_min2, y_min2, x_max2, y_max2) in zip(
+            bboxes1, bboxes2
+        ):
+            block1 = img[int(y_min1) : int(y_max1), int(x_min1) : int(x_max1)]
+            block2 = img[int(y_min2) : int(y_max2), int(x_min2) : int(x_max2)]
+            hist1 = cv2.calcHist([block1], [0], None, [180], [0, 179])  # 计算直方图
+            hist2 = cv2.calcHist([block2], [0], None, [180], [0, 179])
+            cv2.normalize(
+                hist1, hist1, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX
+            )  # 归一化
+            cv2.normalize(hist2, hist2, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+            similarity = 1 - cv2.compareHist(
+                hist1, hist2, cv2.HISTCMP_BHATTACHARYYA
+            )  # 计算相似度
+            sim.append(similarity)
+        return torch.tensor(sim).unsqueeze(-1).to("cuda")

@@ -22,3 +22,4 @@ log_processor = dict(type='LogProcessor', window_size=50, by_epoch=True)
 log_level = 'INFO'
 load_from = None
 resume = False
+work_dir = '/home/work_dirs/bg_cascade_mask_rcnn_r101_fpn_1x_4'  
